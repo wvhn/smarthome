@@ -1,4 +1,5 @@
-# smarthome
-Modifications on Smarthome.py used on an Tebis TS KNX system
+# smarthome integration on a Tebis TS KNX System
+Modifications (HW/SW) for smarthome.py / SmarthomeNG.py used to connect to a Tebis TS KNX system
+Hardware: Raspberry Pi with Busware ROT and piups uninterruptable power supply
 
 see the Wiki section to discover the documentation
