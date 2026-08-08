@@ -1,0 +1,165 @@
+# Metadata for the Smart-Plugin
+plugin:
+    # Global plugin attributes
+    type: interface                 # plugin type (gateway, interface, protocol, system, web)
+    description:
+        de: 'Steuerung ROTO- Dachfenster'
+        en: 'control ROTO roof window'
+    maintainer: 'ivande'
+#    tester:                        # Who tests this plugin?
+#    keywords: iot xyz
+#    documentation: https://github.com/smarthomeNG/smarthome/wiki/CLI-Plugin        # url of documentation (wiki) page
+#    support: https://knx-user-forum.de/forum/supportforen/smarthome-py
+
+    version: 1.6.2                 # Plugin version
+    sh_minversion: 1.8             # minimum shNG version to use this plugin
+#    sh_maxversion:                 # maximum shNG version to use this plugin (leave empty if latest)
+    multi_instance: False           # plugin supports multi instance
+    classname: Roto          # class containing the plugin
+
+parameters: NONE
+    # Definition of parameters to be configured in etc/plugin.yaml
+
+item_attributes:
+    # Definition of item attributes defined by this plugin
+    type:
+        type: str
+        valid_list:
+          - 'bool'
+        valid_list_description:
+            de: ['Der Item Typ muss auf bool gestellt werden!']
+            en: ['The item type has to be set to bool']
+        description:
+            de: 'Datentyp des Objekt-Items. Muss "bool" sein.'
+            en: 'Data type of the object item. Has to be "bool"'
+    roto_plugin:
+        type: str
+        mandatory: True
+        valid_list:
+          - 'active'
+          - 'inactive'
+        valid_list_description:
+            de: ['Aktiviert das Plugin', 'Jeder andere Wert deaktiviert das Plugin']
+            en: ['Activates the plugin', 'Any other value deactivates the plugin']
+        description:
+            de: 'Kennzeichnet das Item als Objekt-Item des Roto-Plugins. Ist der Wert nicht "active", werden keine Zustände evaluiert.'
+            en: 'Makes the Roto-Plugin aware of this item as an object item. If the value is not "active", the state are not evaluated.'
+    roto_actor_move:
+        type: str
+        description:
+            de: 'Item auf welches das Plugin Fahrbefehle schreibt'
+            en: 'Item for sending move commands'
+    roto_position:
+        type: str
+        description:
+            de: 'Item für den Istwert der Position der Jalousie'
+            en: 'Item for the actual shutter position'
+    roto_position_set:
+        type: str
+        description:
+            de: 'Fährt Position an, wenn das angegebene Item geschrieben wird'
+            en: 'Item for the set value of the shutter position'
+    roto_angle:
+        type: str
+        description:
+            de: 'Item für den Istwert des Lamellenwinkels'
+            en: 'Item for the actual shutter angle'
+    roto_angle_set:
+        type: str
+        description:
+            de: 'Sollwert für den Lamellenwinkel. Wird angefahren, wenn das angegebene Item geschrieben wird'
+            en: 'Item for the set value of the shutter angle'
+    roto_move:
+        type: str
+        description:
+            de: 'Item, das auf externe Fahrbefehle hört'
+            en: 'Item listening to external move commands'
+    roto_time_down:
+        type: num
+        default: 60
+        description:
+            de: 'benötigte Zeit (Sekunden) zum Runterfahren'
+            en: 'Time (seconds) for a complete downward move'
+    roto_time_up:
+        type: num
+        default: 60
+        description:
+            de: 'benötigte Zeit (Sekunden) zum Hochfahren'
+            en: 'Time (seconds) for a complete upward move'
+    roto_angle_step:
+        type: num
+        default: 10
+        description:
+            de: 'Winkel pro ausgeführtem Schritt im Schrittbetrieb des Aktors'
+            en: 'Angle increment in step mode of the actor'
+    roto_angle_hyst:
+        type: num
+        default: 10
+        description:
+            de: 'Anzahl Schritte Hysterese beim Aufwärts-Schrittbetrieb des Aktors'
+            en: 'number of steps hysteresis when moving angle stepwise up'
+    roto_cycle_time:
+        type: num
+        default: 5
+        description:
+            de: 'Zykluszeit für den Scheduler'
+            en: 'Cycle time for the scheduler'
+
+plugin_functions: NONE
+# Definition of plugin functions defined by this plugin
+
+logic_parameters: NONE
+    # Definition of logic parameters defined by this plugin
+
+item_structs:
+    child:
+        name: Vorlage-Struktur für Roto-items
+
+        pos:
+            remark: actual value of the shutter position
+            type: num
+            cache: True
+            visu_acl: rw
+
+            soll:
+                remark: set value for the shutter position
+                type: num
+                visu_acl: rw
+                enforce_updates: True
+
+        winkel:
+            remark: actual value of the shutter angle
+            type: num
+            cache: True
+            visu_acl: rw
+
+            soll:
+                remark: set value for the shutter angle
+                type: num
+                visu_acl: rw
+                enforce_updates: True
+
+        Roto:
+            type: bool
+            eval_trigger:
+                - ..move
+                - ..pos.soll
+                - ..winkel.soll
+            eval: not sh..()
+            roto_move: ..move
+            roto_position: ..pos
+            roto_position_set: ..pos.soll
+            roto_angle: ..winkel
+            roto_angle_set: ..winkel.soll
+            roto_actor_move: ..move
+            # ----------------------------------------------------------------
+            # individual shutter settings to be defined in main item structure
+            # ----------------------------------------------------------------
+            # roto_plugin: set "active" to activate the plugin for the item
+            # roto_time_up: full upward travel time in seconds
+            # roto_time_down: full downward travel time in seconds
+            # roto_angle_step: blade angle difference per step in stepping mode
+            # roto_angle_hyst: blade angle hsystersis - steps before upward movement starts
+            # roto_cycle_time: cycle time for the scheduler
+
+
