@@ -1,15 +1,15 @@
-# roto_plugin
+# roto_plugin for Tebis TS shutters
 
 The plugin calculates the current position of a shutter over the running time and the blade angle over the step increments.
-The position is continuously updated in the position Item using a scheduler with adjustable cycle time. 
+The position is continuously updated in the position item using a scheduler with adjustable cycle time. 
 
 Referencing:
-When you first start the plugin, the position is assumed to be 50%. (Item is set with value = 50 to initial value 50%)
+When you first start the plugin, the position is taken from item cache. 
 If the shutter is completely opened or closed, the position will be corrected to roto_time_up or roto_time_down.
 
 # Requirements 
 
-A shutter actuator with only one group address and one output whith no position evaluation
+A shutter actuator with only one group address and no return channel. The plugin uses control values from a Tebis TS system (see wiki section for some hints)
 
 # Configuration
 
@@ -78,7 +78,7 @@ eg:
                     knx_send: 2/0/2
                     enforce_updates: True
 
-                struct: priv_roto.child
+                struct: priv_roto.shutter
                 Roto:
                     # refer to plugin struct. We need only the individual parameters here.
                     roto_plugin: active
