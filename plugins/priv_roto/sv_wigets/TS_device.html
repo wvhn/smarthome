@@ -1,0 +1,116 @@
+/**
+* -----------------------------------------------------------------------------
+* @package     smartVISU
+* @author      Martin Gleiss, Wolfram v. Hülsen
+* @copyright   2015 - 2026
+* @license     GPL [http://www.gnu.de]
+* -----------------------------------------------------------------------------
+*/
+
+
+/**
+* Tebis TS blind with plugin for position control
+*
+* @param {id=} unique id for this widget
+* @param {text=} name of the blind
+* @param {item(num)} an item for the up- and down- movement (up=4, down=8; step up=7, step down=11, stop=7)
+  item structure is from Roto plugin struct: item.move, item.pos, item.pos.soll, item.winkel, item.winkel.soll
+* @param {value=0} the minimum value for close (optional, default 0)
+* @param {value=255} the maximum value for open (optional, default 255)
+* @param {value=5} step between two values for position and angle(optional, default 5)
+*
+* @info inspired by Frank Berlenz
+*/
+{% macro blind(id, txt, item, value_top, value_bottom, step) %}
+    {% import "@widgets/basic.html" as basic %}
+    {% set uid = uid(page, id) %}
+
+    <div class="blind">
+        <table align="center" cellpadding="0">
+            <tr>
+                <td valign="top">
+                    <div class="set">{{ basic.stateswitch(id~'up', item~'.move', '', 4, icon0~'control_arrow_upward.svg') }}</div>
+                    <div class="set">{{ basic.stateswitch(id~'stepup', item~'.move', '', 7, icon0~'control_arrow_up.svg') }}</div>
+                </td>
+                <td rowspan="3" align="left" class="pos">
+                    {{ basic.slider(id~'pos', item~'.pos:'~item~'.pos.soll', value_top|default('0'), value_bottom|default('255'), step|default(5), 'vertical', '', '', '', 0) }}</td>
+                <td rowspan="2" valign="bottom" class="angle">
+                    {{ txt }}<br />
+                    {{ basic.slider(id~'angle', item~'.winkel:'~item~'.winkel.soll', value_top|default('0'), value_bottom|default('255'), step|default(5), 'semicircle', '', '', '', 0) }}
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    <div class="set">{{ basic.stateswitch(id~'stop', item~'.move', '', 7, 'delete') }}</div> </td>
+            </tr>
+            <tr>
+                <td valign="bottom">
+                    <div class="set">{{ basic.stateswitch(id~'stepdown', item~'.move', '', 11, icon0~'control_arrow_down.svg') }}</div>
+                    <div class="set">{{ basic.stateswitch(id~'down', item~'.move', '', 8, icon0~'control_arrow_downward.svg') }}</div>
+                </td>
+            </tr>
+        </table>
+    </div>
+{% endmacro %}
+
+
+/**
+* Tebis TS shutter with plugin for position control
+*
+* @param {id=} unique id for this widget
+* @param {text=} name of the shutter
+* @param {item(num)} an item for the up- and down- movement (up=4, down=8; step up=7, step down=11, stop=7)
+  item structure is from Roto plugin struct: item.move, item.pos, item.pos.soll, item.winkel, item.winkel.soll
+* @param {value=0} the minimum value for close (optional, default 0)
+* @param {value=255} the maximum value for open (optional, default 255)
+* @param {value=5} step between two values (optional, default 5)
+* @param {text(half, full)=} the mode: 'half' blade turns from -1 to +1, or 'full' blade turns from 0 to +1 (optional, default 'half')
+* @param {image=} a background image url (relative to smartVISU directory or absolute); optimal size is 100px x 180px (optional)
+* @param {value=0} the value to send for position 1 (optional, default 0)
+* @param {value=1} the value to send for position 2 (optional, default 1)
+* @param {text=Pos1} the text printed on button for position 1 (optional, default Pos1)
+* @param {text=Pos2} the text printed on button for position 2 (optional, default Pos2)
+*
+* @info inspired by Jörg Gutowski
+*/
+{% macro shutter(id, txt, item, value_top, value_bottom, step, mode, background, value_pos_1, value_pos_2, text_pos_1, text_pos_2) %}
+    {% import "@widgets/basic.html" as basic %}
+    {% set uid = uid(page, id) %}
+
+    <div class="blind">
+        <table align="center" cellpadding="0">
+            <tr>
+                <td valign="top">
+                    <div class="set">{{ basic.stateswitch(id~'up', item~'.move', '', 4,  icon0~'control_arrow_upward.svg') }}</div>
+                    <div class="set">{{ basic.stateswitch(id~'stepup', item~'.move', '', 7, icon0~'control_arrow_up.svg') }}</div>
+                </td>
+                <td rowspan="3" align="center" class="pos">
+                    {{ basic.shutter(id, item~'.pos:'~item~'.pos.soll', item~'.winkel:'~item~'.winkel.soll', value_top, value_bottom, step|default(5), mode) }}
+                </td>
+                <td valign="top">
+                    {% if value_pos_1 %}
+                        <div>{{ basic.stateswitch(id~'saved1', item~'.pos:'~item~'.pos.soll', '', value_pos_1, 'grid', text_pos_1|default('Pos1'), '', 'blink:80') }} </div>
+                    {% endif %}
+                </td>
+            </tr>
+            <tr>
+                <td valign="center">
+                    <div class="set">{{ basic.stateswitch(id~'stop', item~'.move', '', 7, 'delete') }}</div> 
+                </td>
+                <td valign="center">{{ txt }}</td>
+            </tr>
+            <tr>
+                <td valign="bottom">
+                    <div class="set">{{ basic.stateswitch(id~'stepdown', item~'.move', '', 11, icon0~'control_arrow_down.svg') }}</div>
+                    <div class="set">{{ basic.stateswitch(id~'down', item~'.move', '', 8, icon0~'control_arrow_downward.svg') }}</div>
+                </td>
+                <td valign="bottom">
+                    {% if value_pos_2 %}
+                        <div>{{ basic.stateswitch(id~'saved1', item~'.pos:'~item~'.pos.soll', '', value_pos_2, 'grid', text_pos_2|default('Pos2'), '', 'blink:80') }} </div>
+                    {% endif %}
+                </td>
+            </tr>
+        </table>
+    </div>
+
+{% endmacro %}
