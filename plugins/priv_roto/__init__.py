@@ -1,578 +1,406 @@
 #!/usr/bin/env python3
 # vim: set encoding=utf-8 tabstop=4 softtabstop=4 shiftwidth=4 expandtab
 #########################################################################
-# Copyright 2013 KNX-User-Forum e.V.            http://knx-user-forum.de/
+#  Copyright 2013 KNX-User-Forum e.V.            http://knx-user-forum.de/
+#  Copyright 2020- ivande
+#  Rewrite 2026-      <AUTHOR>                                  <EMAIL>
 #########################################################################
-#  This file is part of SmartHome.py.    http://mknx.github.io/smarthome/
+#  This file is part of SmartHomeNG.
+#  https://www.smarthomeNG.de
+#  https://knx-user-forum.de/forum/supportforen/smarthome-py
 #
-#  SmartHome.py is free software: you can redistribute it and/or modify
+#  SmartHomeNG is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
 #  the Free Software Foundation, either version 3 of the License, or
 #  (at your option) any later version.
 #
-#  SmartHome.py is distributed in the hope that it will be useful,
+#  SmartHomeNG is distributed in the hope that it will be useful,
 #  but WITHOUT ANY WARRANTY; without even the implied warranty of
 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #  GNU General Public License for more details.
 #
 #  You should have received a copy of the GNU General Public License
-#  along with SmartHome.py. If not, see <http://www.gnu.org/licenses/>.
+#  along with SmartHomeNG. If not, see <http://www.gnu.org/licenses/>.
+#
 #########################################################################
 
-import logging
-import time
-from lib.model.smartplugin import *
-from lib.item import Items
-from datetime import datetime, timedelta
-from lib.shtime import Shtime
+import datetime
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 
-PLUGIN_ID = 'Roto'
-# Direction
-UP = 0
-DOWN = 1
-OFF = 2
-# values for Tebis TS actor
-MOVEUP = 4
-MOVEDOWN = 8
-STEPUP = 7
-STEPDOWN = 11
-MOVEUP_RELEASE = 6
-MOVEDOWN_RELEASE = 10
-# roto mode: 
-# LISTENING if shutter gets controlled manually then compute positions but do not send actor commands
-# ACTIVE: send actor commands (used for positioning via item_pos ore item_angle)
-LISTENING = 0
-ACTIVE = 1
-# angle values
-OPEN = 0
-CLOSED = 90
+from lib.model.smartplugin import SmartPlugin
+
+# angle bounds (degrees)
+ANGLE_OPEN = 0
+ANGLE_CLOSED = 90
+
+
+class Direction(Enum):
+    OFF = 'off'
+    UP = 'up'
+    DOWN = 'down'
+
+
+class ActorCommand(IntEnum):
+    """values expected by a Tebis-TS style shutter actor without position feedback"""
+
+    MOVEUP = 4
+    STEPUP = 7
+    MOVEDOWN = 8
+    STEPDOWN = 11
+    MOVEUP_RELEASE = 6
+    MOVEDOWN_RELEASE = 10
+
+
+# some actors drop the initial long-move telegram and only reliably send the
+# button-release telegram; if the corresponding move command was not already
+# seen, the release is used as a fallback trigger for it (see _handle_move_command)
+_RELEASE_FALLBACK = {
+    ActorCommand.MOVEUP_RELEASE: ActorCommand.MOVEUP,
+    ActorCommand.MOVEDOWN_RELEASE: ActorCommand.MOVEDOWN,
+}
+
+
+@dataclass
+class _Step:
+    """one queued actor pulse for stepwise angle control"""
+
+    command: ActorCommand
+    angle_delta: int = 0
+    hyst_delta: int = 0
+
 
 class Roto(SmartPlugin):
+    """
+    Calculates and drives the position/blade-angle of a shutter that is
+    connected through an actor with no position feedback (single group
+    address, move/step telegrams only).
+    """
 
+    PLUGIN_VERSION = '2.0.0'
     ALLOW_MULTIINSTANCE = False
-    PLUGIN_VERSION = "1.6.2"
 
-    def __init__(self, smarthome):
-        self.logger.info('Init roto plugin')
+    def __init__(self, sh=None, **kwargs):
+        super().__init__()
 
-        self.logger.debug(f"init {__name__}")
-
-        self.alive = False
-        self._sh = smarthome
-        self.itemsApi = Items.get_instance()
-        self.__roto_items = {}
+        self._shutters: dict[str, RotoShutter] = {}
+        self._item_to_shutter: dict[str, RotoShutter] = {}
+        self._pause_item_path = self.get_parameter_value('pause_item')
 
     def run(self):
         self.alive = True
-        count_items = 0
-        # register all items <item.tree>.Roto using the plugin
-        for item in self.itemsApi.find_items("roto_plugin"):
-            if item.conf["roto_plugin"] == "active":
-                try:
-                    roto_item = RotoItem(self._sh, item)
-                    self.__roto_items[roto_item.id] = roto_item
-                    count_items += 1
-                except ValueError as ex:
-                    self.logger.error("Item: {0}: {1}".format(item.id(), str(ex)))
-
-        self.logger.info("Found {0} Items using the roto plugin".format(count_items))
-        self.logger.info("--------------------   Roto Plugin initialization finished   --------------------")
+        self.logger.info(f'{len(self._shutters)} shutter(s) configured')
+        if self._pause_item:
+            self._pause_item(False, self.get_fullname())
 
     def stop(self):
         self.alive = False
-        
-    # get the plugin attributes from the Roto item
+        if self._pause_item:
+            self._pause_item(True, self.get_fullname())
+        self.scheduler_remove_all()
+
     def parse_item(self, item):
-        if 'roto_plugin' in item.conf and item.conf["roto_plugin"] == "active":
-            item.expand_relativepathes('roto_move', '', '')
-            item.expand_relativepathes('roto_position', '', '')
-            item.expand_relativepathes('roto_position_set', '', '')
-            item.expand_relativepathes('roto_angle', '', '')
-            item.expand_relativepathes('roto_angle_set', '', '')
-            item.expand_relativepathes('roto_actor_move', '', '')
-            self.logger.debug("parse item: {0}".format(item))
+        if item.property.path == self._pause_item_path:
+            self.logger.debug(f'pause item {item.property.path} registered')
+            self._pause_item = item
+            self.add_item(item, updating=True)
             return self.update_item
-        else:
+
+        if not self.has_iattr(item.conf, 'roto_plugin'):
+            return None
+        if self.get_iattr_value(item.conf, 'roto_plugin') != 'active':
             return None
 
-    def parse_logic(self, logic):
-        if 'xxx' in logic.conf:
-            # self.function(logic['name'])
-            pass
+        # the config item itself never receives updates, it only carries the
+        # per-shutter parameters and anchors the sibling lookup below
+        self.add_item(item, config_data_dict={'role': 'config'})
+
+        try:
+            shutter = RotoShutter(self, item)
+        except (AttributeError, KeyError, ValueError) as e:
+            self.logger.error(f'{item.property.path}: could not set up shutter - {e}')
+            return None
+
+        self._shutters[item.property.path] = shutter
+        for control_item in shutter.control_items:
+            self.add_item(
+                control_item, config_data_dict={'role': 'control', 'shutter': item.property.path}, updating=True
+            )
+            control_item.add_method_trigger(self.update_item)
+            self._item_to_shutter[control_item.property.path] = shutter
+
+        return None
 
     def update_item(self, item, caller=None, source=None, dest=None):
-        orig_caller, orig_source, orig_item = self.get_original_caller(self._sh, caller, source, item)
-        # ignore internal item changes in order to avoid infinite loops
-        if orig_caller == PLUGIN_ID or caller == PLUGIN_ID:
-          self.logger.debug("Skipping self-induced changes")
-          return
-
-        item_source = self._sh.return_item(source)
-        self.logger.info("update roto_item: {0} orig_caller: {1} source: {2} item_source: {3}".format(item.id(), orig_caller, source, item_source))
-        if item.id() in self.__roto_items:
-            roto_item = self.__roto_items[item.id()]
-        else:
+        if item is self._pause_item:
+            if caller != self.get_shortname():
+                self.logger.debug(f'pause item changed to {item()}')
+                if item() and self.alive:
+                    self.stop()
+                elif not item() and not self.alive:
+                    self.run()
             return
 
-        item_value = item_source()
-        item_last_value = item_source.property.last_value
-        
-        # listen to manual control by physical pushbuttons or visu control buttons
-        # some long move commands seem to get lost. So make sure they are recognized at least by button release
-        if (source == item.conf['roto_move']):
-            self.logger.debug("{0}: new value: {1} lastvalue: {2} ".format(item_source, item_value, item_last_value))
-            if item_value == MOVEUP_RELEASE:
-                if item_last_value != MOVEUP:
-                    item_value = MOVEUP
-                    self.logger.debug("{0}: move up command changed to {1}". format(item_source, item_value))
-                else:
-                    # item value already correct
-                    return
-            elif item_value == MOVEDOWN_RELEASE:
-                if item_last_value != MOVEDOWN:
-                    item_value = MOVEDOWN
-                    self.logger.debug("{0}: move down command changed to {1}". format(item_source, item_value))
-                else:
-                    # item value already correct
-                    return
-                
-            # self.logger.debug("{0}: updated with value {1} from last value {2} ".format(item_source, item_value, item_last_value))
-            if (item_value == MOVEUP):
-                roto_item.roto_up_manual()
-            elif (item_value == STEPUP):
-                roto_item.roto_step_up_manual()
-            elif (item_value == MOVEDOWN):
-                roto_item.roto_down_manual()
-            elif (item_value == STEPDOWN):
-                roto_item.roto_step_down_manual()
-                
-        # control via position item
-        if (source == item.conf['roto_position_set']):
-            # self.logger.debug("roto position set item updated with value {0} ".format(item_value))
-            position = 0
-            if caller != 'Eval':
-                position = item_value
-            else:
-                position = orig_item()
-            self.logger.debug("{0} set position: {1} ".format(item_source, position))
-            #self.logger.info("roto set position orig_caller: {0}".format(orig_caller))
-            roto_item.roto_position(position)
+        if not self.alive or caller == self.get_fullname():
+            return
 
-        # control via angle item
-        if (source == item.conf['roto_angle_set']):
-            #self.logger.debug("{0} updated with value {1} ".format(item_source, item_value))
-            angle = 0
-            if caller != 'Eval':
-                angle = item_value
-            else:
-                angle = orig_item()
-            self.logger.debug("{0} set angle: {1}".format(item_source, angle))
-            #self.logger.info("roto set position orig_caller: {0}".format(orig_caller))
-            roto_item.roto_angle(angle)
+        shutter = self._item_to_shutter.get(item.property.path)
+        if shutter is None:
+            return
 
-    # determine original caller/source
-    # smarthome: instance of smarthome.py
-    # caller: caller
-    # source: source
-    def get_original_caller(self, smarthome, caller, source, item=None):
-        original_caller = caller
-        original_source = source
-        original_item = item
-        while original_caller == "Eval":
-            original_item = smarthome.return_item(original_source)
-            if original_item is None:
-                break
-            original_changed_by = original_item.changed_by()
-            if ":" not in original_changed_by:
-                break
-            original_caller, __, original_source = original_changed_by.partition(":")
-        if item is None:
-            return original_caller, original_source
-        else:
-            return original_caller, original_source, original_item
+        if item is shutter.item_move:
+            self._handle_move_command(shutter, item)
+        elif item in (shutter.item_position_set, shutter.item_angle_set):
+            shutter.apply_setpoints()
 
-
-# Class
-class RotoItem:
-    # return item id
-    @property
-    def id(self):
-        return self.__id
-
-    # time counter
-    @property
-    def time_on(self):
-        return self.__time_on
-
-    @time_on.setter
-    def time_on(self, value):
-        self.__time_on = value
-
-    # time counter
-    @property
-    def time_off(self):
-        return self.__time_off
-
-    @time_off.setter
-    def time_off(self, value):
-        self.__time_off = value
-
-    @property
-    def time_up(self):
-        return self.__time_up
-
-    @property
-    def time_down(self):
-        return self.__time_down
-
-    @property
-    def item_move(self):
-        return self.__item_move
-
-    # position counter
-    @property
-    def position(self):
-        return self.__position
-
-    @position.setter
-    def position(self, value):
-        self.__position = value
-
-    # angle counter
-    @property
-    def angle(self):
-        return self.__angle
-
-    @angle.setter
-    def angle(self, value):
-        self.__angle = value
-        
-    @property
-    def hysteresis(self):
-        return self.__hysteresis
-
-    # return instance of smarthome.py class
-    @property
-    def sh(self):
-        return self.__sh
-
-    # Constructor
-    # smarthome: instance of smarthome.py
-    # item: item to use
-    def __init__(self, smarthome, item):
-        self.logger = logging.getLogger(__name__)
-        self.__sh = smarthome
-        self.__item = item
-        self.__id = self.__item.id()
-        self.__name = str(self.__item)
-        self.__timezone = Shtime.get_instance().tzinfo()
-        self.__time_on = datetime.now(self.__timezone)
-        self.__time_off = datetime.now(self.__timezone)
-        self.__time_last_loop = datetime.now(self.__timezone)
-
-        self.__time_up = 60
-        if 'roto_time_up' in item.conf:
-            self.__time_up = int(item.conf['roto_time_up'])
-
-        self.__time_down = 60
-        if 'roto_time_down' in item.conf:
-            self.__time_down = int(item.conf['roto_time_down'])
-
-        self.__angle_step = 10
-        if 'roto_angle_step' in item.conf:
-            self.__angle_step = int(item.conf['roto_angle_step'])
-
-        self.__angle_hyst = 0
-        if 'roto_angle_hyst' in item.conf:
-            self.__angle_hyst = int(item.conf['roto_angle_hyst'])
-
-        self.__cycle_time = 5
-        if 'roto_cycle_time' in item.conf:
-            self.__cycle_time = int(item.conf['roto_cycle_time'])
-
-        if 'roto_actor_move' in item.conf:
-            self.__item_move = self.__sh.return_item(item.conf['roto_actor_move'])
-        else:
-            self.logger.error("{0}: roto actor_move item missing or faulty".format(self.__id))
-
-        # items for actual and set values of the shutter position
-        if 'roto_position' in item.conf:
-            self.__item_position = self.__sh.return_item(item.conf['roto_position'])
-        else:
-            self.logger.error("{0}: roto position item missing or faulty".format(self.__id))
-
-        if 'roto_position_set' in item.conf:
-            self.__item_position_set = self.__sh.return_item(item.conf['roto_position_set'])
-        else:
-            self.logger.error("{0}: roto position_set item missing or faulty".format(self.__id))
-
-        # items for actual and set value of the shutter angle
-        if 'roto_angle' in item.conf:
-            self.__item_angle = self.__sh.return_item(item.conf['roto_angle'])
-        else:
-            self.logger.error("{0}: roto angle item missing or faulty".format(self.__id))
-
-        if 'roto_angle_set' in item.conf:
-            self.__item_angle_set = self.__sh.return_item(item.conf['roto_angle_set'])
-        else:
-            self.logger.error("{0}: roto angle set item missing or faulty".format(self.__id))
-
-        self.__delays = []
-        self.__direction = OFF
-        self.__position = self.__item_position()
-        self.__item_position_set(self.__position)
-        self.__position_time = self.__time_up / 100 * self.__position
-        self.__direction = OFF
-        self.__angle = self.__item_angle()
-        self.__item_angle_set(self.__angle)
-        self.__hysteresis = self.__angle_hyst
-        self.logger.debug("item {0} initialized with parameters time_up: {1}, time_down: {2}, angle_Step: {3}, angle_hyst: {4}, cycle_time: {5}".format(self.__id, self.__time_up, self.__time_down, self.__angle_step, self.__angle_hyst, self.__cycle_time))
-
-    def roto_position(self, position):
-        if self.__direction != OFF:
-            self.roto_stop(ACTIVE)
-            time.sleep(2)
-            if self.__direction != OFF:
-                self.logger.info("{0}: roto position can not be set since shutter is already running: {1}".format(self.__id, self.__position))
+    def _handle_move_command(self, shutter, item):
+        value = item()
+        replacement = _RELEASE_FALLBACK.get(value)
+        if replacement is not None:
+            if item.property.last_value == replacement:
+                # long-move telegram already seen, ignore the release echo
                 return
+            value = replacement
 
-        new_pos = position
-        old_pos = self.__position
+        if value == ActorCommand.MOVEUP:
+            shutter.move_up_manual()
+        elif value == ActorCommand.MOVEDOWN:
+            shutter.move_down_manual()
+        elif value == ActorCommand.STEPUP:
+            shutter.step_up_manual()
+        elif value == ActorCommand.STEPDOWN:
+            shutter.step_down_manual()
 
-        self.logger.debug("{0}: roto_position old:{1} new:{2}".format(self.__id, old_pos, new_pos))  
 
-        # Downward travel
-        if new_pos > old_pos:
-            diff_pos = new_pos - old_pos
-            diff_time = self.__time_down / 100 * diff_pos
-            # ignore small changes below minimum cycle time
-            if diff_time > 1:
-                self.roto_down(diff_time, ACTIVE)
+class RotoShutter:
+    """Position/angle model and actor control for a single shutter."""
 
-        # Upward travel:
-        elif new_pos < old_pos:
-            diff_pos = old_pos - new_pos
-            diff_time = self.__time_up / 100 * diff_pos
-            # ignore small changes below minimum cycle time
-            if diff_time > 1:
-                self.roto_up(diff_time, ACTIVE)
+    def __init__(self, plugin: Roto, config_item):
+        self.plugin = plugin
+        self.logger = plugin.logger
+        self.id = config_item.property.path
 
-    def roto_up(self, travel_time, mode):
-        if self.__direction != OFF:
-            self.roto_stop(mode)
-            #time.sleep(2)
+        parent = config_item.return_parent()
+        if parent is None:
+            raise ValueError('config item has no parent; expected siblings move/pos/winkel')
+        try:
+            self.item_move = parent['move']
+            self.item_position = parent['pos']
+            self.item_position_set = parent['pos']['soll']
+            self.item_angle = parent['winkel']
+            self.item_angle_set = parent['winkel']['soll']
+        except KeyError as e:
+            raise ValueError(f'required sibling item {e} not found under {parent.property.path}') from e
 
-        if mode == ACTIVE:
-            self.__item_move(MOVEUP, caller = PLUGIN_ID)
-        self.__direction = UP
-        self.__time_on = datetime.now(self.__timezone)
-        self.__time_last_loop = datetime.now(self.__timezone)
-        self.roto_add_delay(UP, travel_time, mode)
-        self.__angle = OPEN
-        self.__item_angle(self.__angle, caller = PLUGIN_ID)
+        conf = config_item.conf
+        self._time_up = float(self.plugin.get_iattr_value(conf, 'roto_time_up', 60))
+        self._time_down = float(self.plugin.get_iattr_value(conf, 'roto_time_down', 60))
+        self._angle_step = float(self.plugin.get_iattr_value(conf, 'roto_angle_step', 10))
+        self._angle_hyst = int(self.plugin.get_iattr_value(conf, 'roto_angle_hyst', 0))
+        self._cycle_time = int(self.plugin.get_iattr_value(conf, 'roto_cycle_time', 5))
 
-    def roto_down(self, travel_time, mode):
-        if self.__direction != OFF:
-            self.roto_stop(mode)
- 
-        if mode == ACTIVE:
-            self.__item_move(MOVEDOWN, caller = PLUGIN_ID)
-        self.__direction = DOWN
-        self.__time_on = datetime.now(self.__timezone)
-        self.__time_last_loop = datetime.now(self.__timezone)
-        self.roto_add_delay(DOWN, travel_time, mode)
-        self.__angle = CLOSED
-        self.__item_angle(self.__angle, caller = PLUGIN_ID)
-        self.__hysteresis = self.__angle_hyst
+        self._direction = Direction.OFF
+        self._move_started = self.plugin.now()
+        self._loop_last_run = self._move_started
+        self._pending_stop: dict | None = None
+        self._pending_steps: list[_Step] = []
 
-    # stop movement
-    # mode = ACTIVE: stop movement actively
-    # mode = LISTENING: clear variables after manual stop
-    def roto_stop(self, mode):
-        if self.__direction != OFF:
-            if mode == ACTIVE:
-                 self.__item_move(STEPUP, caller = PLUGIN_ID)
-            self.logger.debug("{0}: Stop in position: {1}".format(self.__id, self.__position))
-            self.__delays = []
-            self.__direction = OFF
-            
-    # -------------------------------------------------------------------------------------------
-    # Handling of manual commands (physical pushbutton or visu) received via item_move
-    # -------------------------------------------------------------------------------------------
-    # mode = LISTENING: do not actively control but keep status information up to date
-    def roto_up_manual(self):
-        self.roto_up(self.__time_up, LISTENING)
+        self._position = self.item_position() or 0
+        self._position_time = self._time_up / 100 * self._position
+        self.item_position_set(self._position, caller=self.plugin.get_fullname())
 
-    def roto_down_manual(self):
-        self.roto_down(self.__time_down, LISTENING)
+        self._angle = self.item_angle() or 0
+        self._hysteresis = self._angle_hyst
+        self.item_angle_set(self._angle, caller=self.plugin.get_fullname())
 
-    def roto_step_up_manual(self):
-        increment = 0
-        if self.__direction == OFF:
-            increment = self.__angle_step
-        self.roto_stop(LISTENING)
-        old_angle = self.__angle
-        if old_angle == CLOSED and self.__hysteresis > 0:
-            self.__hysteresis -= 1
+        self.logger.debug(
+            f'{self.id}: initialized time_up={self._time_up} time_down={self._time_down} '
+            f'angle_step={self._angle_step} angle_hyst={self._angle_hyst} cycle_time={self._cycle_time}'
+        )
+
+    @property
+    def control_items(self):
+        return (self.item_move, self.item_position_set, self.item_angle_set)
+
+    # -------------------------------------------------------------------
+    # commands driven by pos.soll / winkel.soll (mode ACTIVE: plugin drives the actor)
+    # -------------------------------------------------------------------
+
+    def apply_setpoints(self):
+        """
+        Called for a write to *either* pos.soll or winkel.soll.
+        """
+        self.set_position(self.item_position_set())
+        self.set_angle(self.item_angle_set())
+
+    def set_position(self, position):
+        if self._direction != Direction.OFF:
+            self._stop(active=True)
+
+        diff = position - self._position
+        if abs(diff) < 1e-9:
+            return
+        if diff > 0:
+            travel_time = self._time_down / 100 * diff
+            if travel_time > 1:
+                self._move(Direction.DOWN, travel_time, active=True)
         else:
-            self.__angle = max(OPEN, old_angle - increment)
-            self.__item_angle(self.__angle, caller = PLUGIN_ID)
+            travel_time = self._time_up / 100 * -diff
+            if travel_time > 1:
+                self._move(Direction.UP, travel_time, active=True)
 
-    def roto_step_down_manual(self):
-        increment = 0
-        if self.__direction == OFF:
-            increment = self.__angle_step
-        self.roto_stop(LISTENING)
-        old_angle = self.__angle
-        self.__angle = min(CLOSED, old_angle + increment)
-        self.__item_angle(self.__angle, caller = PLUGIN_ID)
-        if old_angle == CLOSED and self.__hysteresis < self.__angle_hyst:
-            self.__hysteresis += 1
+    def set_angle(self, angle):
+        angle = max(ANGLE_OPEN, min(ANGLE_CLOSED, angle))
 
-    # -------------------------------------------------------------------------------------------
-    # Position and angle calculation and control functions
-    # -------------------------------------------------------------------------------------------
-    def roto_add_delay(self, direction, travel_time, mode):
-        new_delay = {}
-        new_delay.update({'delay': travel_time})
-        new_delay.update({'direction': direction})
-        new_delay.update({'mode': mode})
-        self.__delays.append(new_delay)
-        self.logger.debug("{0}: roto added new delay: {1}".format(self.__id, new_delay))
+        if self._direction != Direction.OFF:
+            # a full move is in progress; retry once it is expected to be done
+            # instead of blocking the caller until then
+            elapsed = (self.plugin.now() - self._move_started).total_seconds()
+            remaining = (self._pending_stop['travel_time'] - elapsed) if self._pending_stop else 0
+            next_try = self.plugin.now() + datetime.timedelta(seconds=max(1, remaining + 1))
+            self.plugin.scheduler_add(f'{self.id}_angle', self._retry_set_angle, prio=5, next=next_try)
+            return
 
-        if self.__id not in self.__sh.scheduler:
-            s = self.__sh.scheduler.add(self.__id, self.roto_loop, prio=5, offset = 2, cycle=int(self.__cycle_time))
+        diff = angle - self._angle
+        if diff == 0:
+            return
 
-    # sort array of delays and return the specified element in the sorted sequence
-    # e.g. 0 = first, -1 = last ... 
-    def roto_get_delay(self, element):
-        # sort delays list
-        from operator import itemgetter
-        x_delays = [x for x in self.__delays]
-        x_delays.sort(key=itemgetter('delay'), reverse=False)
-        if len(x_delays) == 0: 
-            return {}
+        direction = -1 if diff < 0 else 1
+        command = ActorCommand.STEPUP if direction == -1 else ActorCommand.STEPDOWN
+        step_count = round(abs(diff) / self._angle_step)
+
+        steps = []
+        if direction == -1 and self._hysteresis > 0 and self._angle == ANGLE_CLOSED:
+            steps.extend(_Step(ActorCommand.STEPUP, hyst_delta=-1) for _ in range(self._hysteresis))
+        steps.extend(_Step(command, angle_delta=direction * self._angle_step) for _ in range(step_count))
+
+        self._queue_steps(steps)
+
+    def _retry_set_angle(self):
+        # re-read the current setpoint rather than the value captured when the
+        # retry was scheduled, in case it changed again in the meantime
+        self.set_angle(self.item_angle_set())
+
+    # -------------------------------------------------------------------
+    # manual commands from a physical pushbutton or visu (mode LISTENING:
+    # the actor already executed the command on its own, the plugin only
+    # keeps its position/angle bookkeeping in sync)
+    # -------------------------------------------------------------------
+
+    def move_up_manual(self):
+        self._move(Direction.UP, self._time_up, active=False)
+        self.item_position_set(0, caller=self.plugin.get_fullname())
+
+    def move_down_manual(self):
+        self._move(Direction.DOWN, self._time_down, active=False)
+        self.item_position_set(100, caller=self.plugin.get_fullname())
+
+    def step_up_manual(self):
+        increment = self._angle_step if self._direction == Direction.OFF else 0
+        self._stop(active=False)
+        if self._angle == ANGLE_CLOSED and self._hysteresis > 0:
+            self._hysteresis -= 1
         else:
-            return x_delays[element]
+            self._angle = max(ANGLE_OPEN, self._angle - increment)
+            self.item_angle(self._angle, caller=self.plugin.get_fullname())
 
-    # Control loop to be called by the scheduler
-    def roto_loop(self):
-        #self.logger.debug("roto_loop: {0} entries registered in delays array".format(len(self.__delays)))
-        # deactivate scheduler if no entries available
-        if (len(self.__delays)) == 0:
-            if self.__id in self.__sh.scheduler:
-                self.logger.debug("{0}: roto_loop STOP scheduler".format(self.__id))
-                self.__sh.scheduler.remove(self.__id)
-                self.__direction = OFF
-            else:
-                self.logger.debug("{0}: roto_loop: scheduler found to remove".format(self.__id))
+    def step_down_manual(self):
+        increment = self._angle_step if self._direction == Direction.OFF else 0
+        self._stop(active=False)
+        old_angle = self._angle
+        self._angle = min(ANGLE_CLOSED, self._angle + increment)
+        self.item_angle(self._angle, caller=self.plugin.get_fullname())
+        if old_angle == ANGLE_CLOSED and self._hysteresis < self._angle_hyst:
+            self._hysteresis += 1
+
+    # -------------------------------------------------------------------
+    # full-move control + position tracking, driven by a per-shutter scheduler
+    # -------------------------------------------------------------------
+
+    def _move(self, direction: Direction, travel_time: float, active: bool):
+        if self._direction != Direction.OFF:
+            self._stop(active)
+        # a full move overrides any in-flight stepwise angle adjustment
+        self._pending_steps.clear()
+
+        if active:
+            command = ActorCommand.MOVEDOWN if direction == Direction.DOWN else ActorCommand.MOVEUP
+            self.item_move(command, caller=self.plugin.get_fullname())
+
+        self._direction = direction
+        self._move_started = self.plugin.now()
+        self._loop_last_run = self._move_started
+        self._pending_stop = {'travel_time': travel_time, 'active': active}
+
+        self._angle = ANGLE_CLOSED if direction == Direction.DOWN else ANGLE_OPEN
+        self.item_angle(self._angle, caller=self.plugin.get_fullname())
+        if direction == Direction.DOWN:
+            self._hysteresis = self._angle_hyst
+
+        if self.id not in self.plugin.scheduler_get_all():
+            self.plugin.scheduler_add(self.id, self._loop, prio=5, offset=2, cycle=self._cycle_time)
+
+    def _stop(self, active: bool):
+        if self._direction == Direction.OFF:
+            return
+        if active:
+            self.item_move(ActorCommand.STEPUP, caller=self.plugin.get_fullname())
         else:
-            time_on_sec = (datetime.now(self.__timezone) - self.__time_on).total_seconds()
-            # get first delay
-            x_delay = self.roto_get_delay(0)
-            if x_delay == {}:
-                self.logger.debug("{0} roto_loop: no entries in array x_delays".format(self.__id))
-                return
+            self.item_position_set(self._position, caller=self.plugin.get_fullname())
+        self._pending_stop = None
+        self._direction = Direction.OFF
 
-            # Calculate shutter position by the travel time
-            self.roto_calc_pos()
-            self.__time_last_loop = datetime.now(self.__timezone)
-            self.logger.debug("{0}: roto_loop Position: {1}".format(self.__id, self.__position))
+    def _loop(self):
+        if self._pending_stop is None:
+            self.plugin.scheduler_remove(self.id)
+            self._direction = Direction.OFF
+            return
 
-            # stop movement if time reaches / exeeds the calculated delay
-            # mode = ACTIVE: stop movement actively
-            # mode = LISTENING: clear variables at the end of manually started full move (roto_up_manual / roto_down_manual)
-            if self.__direction != OFF and time_on_sec >= x_delay['delay']:
-                if x_delay['mode'] == ACTIVE:
-                    self.__item_move(STEPUP, caller = PLUGIN_ID)
-                self.__time_off = datetime.now(self.__timezone)
-                self.__direction = OFF
-                self.__delays.remove(x_delay)
-                self.logger.debug("{0}: roto_loop finished at position: {1} ".format(self.__id, self.__position))
-                # update angle_item 
-                self.__item_angle(self.__angle, caller = PLUGIN_ID)
-            #self.logger.info("roto_loop END")
+        now = self.plugin.now()
+        self._update_position(now)
+        self._loop_last_run = now
 
-    def roto_calc_pos(self):
-        time_loop_sec = (datetime.now(self.__timezone) - self.__time_last_loop).total_seconds()
-        if self.__time_on > self.__time_off:
-            if self.__direction == DOWN:
-                self.__position_time += time_loop_sec
-                if self.__position_time > self.__time_down:
-                    self.__position_time = self.__time_down
-                self.__position = self.__position_time * 100 / self.__time_down
+        elapsed = (now - self._move_started).total_seconds()
+        if elapsed >= self._pending_stop['travel_time']:
+            self._stop(active=self._pending_stop['active'])
+            self.item_angle(self._angle, caller=self.plugin.get_fullname())
 
-            elif self.__direction == UP:
-                self.__position_time -= time_loop_sec
-                if self.__position_time < 0:
-                    self.__position_time = 0
-                self.__position = self.__position_time * 100 / self.__time_up
-            self.__item_position(self.__position, caller=PLUGIN_ID) # aktualisiere das Item
-            return self.__position
-        else:
-            self.logger.error("{0}: Shutter position can not be calculated. time_on [1} <= time_off {2} ".format(self.__id, self.__time_on, self.__time_off))
-
-    def roto_angle(self, angle):
-        if self.__direction != OFF:
-            # get last delay
-            x_delay = self.roto_get_delay(-1)
-            time_left = x_delay['delay'] - (datetime.now(self.__timezone) - self.__time_on).total_seconds() + 1
-            if time_left > 1:
-                _next= datetime.now(self.__timezone) + timedelta(seconds=time_left)
-                self.logger.debug("roto_angle: time left for movement: {0}. Scheduler loaded with: {1} - now = {2}".format(time_left, _next, datetime.now(self.__timezone)))
-                s = self.__sh.scheduler.add(self.__id + '_angle', self.roto_angle_delayed, prio=5, offset = 2, next=_next)
-                return
-            else: 
-                # self.roto_stop(ACTIVE)
-                self.logger.debug("roto_angle: waiting 2 seconds for last movement to stop")
-                time.sleep(2)
-                if self.__direction != OFF:
-                    self.logger.info("{0}: roto position can not be set since shutter is already running: {1}".format(self.__id, self.__angle))
-                    return
-
-        new_pos = angle
-        if new_pos > CLOSED:
-            new_pos = CLOSED
-        elif new_pos < OPEN:
-            new_pos = OPEN
-        old_pos = self.__angle
-
-        self.logger.debug("{0}: roto_angle calculated angles: old:{1} new:{2}".format(self.__id, old_pos, new_pos))
-
-        diff_pos = new_pos - old_pos
-        direction = 1
-        if diff_pos > 0:
-            command = STEPDOWN
-        elif diff_pos < 0:
-            command = STEPUP
-            direction = -1
+    def _update_position(self, now):
+        elapsed = (now - self._loop_last_run).total_seconds()
+        if self._direction == Direction.DOWN:
+            self._position_time = min(self._position_time + elapsed, self._time_down)
+            self._position = self._position_time * 100 / self._time_down
+        elif self._direction == Direction.UP:
+            self._position_time = max(self._position_time - elapsed, 0)
+            self._position = self._position_time * 100 / self._time_up
         else:
             return
-        
-        # some shutters have an angle hysteresis in stepping up mode
-        if direction == -1 and self.__hysteresis > 0 and self.__angle == CLOSED:
-            count = 0
-            while self.__hysteresis > 0:
-                self.__item_move(STEPUP, caller = PLUGIN_ID)
-                time.sleep(1)
-                self.__hysteresis -= 1
-                count += 1
-            self.logger.debug("{0}: roto_angle moved through hysteresis {1} steps".format(self.__id, count))
+        self.item_position(self._position, caller=self.plugin.get_fullname())
 
-        diff_steps = abs(round(diff_pos / self.__angle_step, 0))
-        self.logger.debug("{0}: roto_angle executing {1} steps to set angle".format(self.__id, diff_steps))
-        count = 1
-        while count <= diff_steps:
-            self.__item_move(command, caller = PLUGIN_ID)
-            self.__angle =  self.__angle + direction * self.__angle_step
-            self.logger.debug("{0}: roto_angle moved angle to {1}".format(self.__id, self.__angle))        
-            self.__item_angle(self.__angle, caller = PLUGIN_ID)
-            time.sleep(1)
-            count += 1
-            
-    def roto_angle_delayed(self):
-        # get latest set value
-        angle = self.__item_angle_set()
-        self.logger.debug("{0} roto_angle_delayed: got angle set value: {1}".format(self.__id, angle))
-        self.roto_angle(angle)
+    # -------------------------------------------------------------------
+    # stepwise angle control, driven by a per-shutter scheduler (one pulse/second)
+    # -------------------------------------------------------------------
 
+    def _queue_steps(self, steps: list[_Step]):
+        if not steps:
+            return
+        already_running = bool(self._pending_steps)
+        self._pending_steps.extend(steps)
+        if not already_running:
+            self.plugin.scheduler_add(f'{self.id}_step', self._step_tick, prio=5, offset=0, cycle=1)
+
+    def _step_tick(self):
+        if not self._pending_steps:
+            self.plugin.scheduler_remove(f'{self.id}_step')
+            return
+
+        step = self._pending_steps.pop(0)
+        self.item_move(step.command, caller=self.plugin.get_fullname())
+        if step.angle_delta:
+            self._angle += step.angle_delta
+            self.item_angle(self._angle, caller=self.plugin.get_fullname())
+        if step.hyst_delta:
+            self._hysteresis = max(0, self._hysteresis + step.hyst_delta)
+
+        if not self._pending_steps:
+            self.plugin.scheduler_remove(f'{self.id}_step')
